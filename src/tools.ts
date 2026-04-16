@@ -1,0 +1,520 @@
+/**
+ * MCP Tool definitions and handlers.
+ *
+ * Exposes 6 read-only tools for semantic search:
+ * - search_by_text: Search using freeform text query (computes embedding locally)
+ * - search_similar: Find notes similar to an existing note
+ * - search_by_embedding: Search using a raw embedding vector
+ * - get_note: Get content of a specific note
+ * - get_model_info: Get embedding model configuration
+ * - list_indexed: List all indexed notes
+ */
+
+import * as fs from 'node:fs';
+import { z } from 'zod';
+import {
+  Config,
+  validateNotePath,
+  validateEmbedding,
+  validateLimit,
+  log,
+} from './security.js';
+import { SmartConnectionsData, extractTitle, refreshIfNeeded } from './data.js';
+import { findSimilar, findSimilarToNote, SearchResult } from './search.js';
+import { Embedder } from './embeddings.js';
+import { reindex } from './indexer.js';
+
+// ============================================================================
+// Tool Schemas (Zod)
+// ============================================================================
+
+export const SearchSimilarSchema = z.object({
+  notePath: z.string().describe('Path to note relative to vault root (e.g., "Topics/Claude_Code.md")'),
+  limit: z.number().min(1).max(50).default(10).describe('Maximum results to return (1-50)'),
+  threshold: z.number().min(0).max(1).default(0.3).describe('Minimum similarity score (0-1)'),
+});
+
+export const SearchByEmbeddingSchema = z.object({
+  embedding: z.array(z.number()).describe('Embedding vector (must match model dimensions)'),
+  limit: z.number().min(1).max(50).default(10).describe('Maximum results to return (1-50)'),
+  threshold: z.number().min(0).max(1).default(0.3).describe('Minimum similarity score (0-1)'),
+});
+
+export const GetNoteSchema = z.object({
+  notePath: z.string().describe('Path to note relative to vault root'),
+});
+
+export const ListIndexedSchema = z.object({
+  pattern: z.string().optional().describe('Filter by path prefix (e.g., "Topics/")'),
+  includeBlocks: z.boolean().optional().default(false).describe('Include block-level entries (default: sources only)'),
+});
+
+export const SearchByTextSchema = z.object({
+  query: z.string().min(1).max(500).describe('Text to search for (max 500 characters)'),
+  limit: z.number().min(1).max(50).default(10).describe('Maximum results to return (1-50)'),
+  threshold: z.number().min(0).max(1).default(0.3).describe('Minimum similarity score (0-1)'),
+});
+
+export const ReindexSchema = z.object({
+  path: z.string().optional().describe('Optional path prefix to limit scope (e.g., "projects/")'),
+});
+
+// ============================================================================
+// Tool Definitions (for MCP registration)
+// ============================================================================
+
+export const toolDefinitions = [
+  {
+    name: 'search_by_text',
+    description: 'Search for notes using freeform text. Computes embedding locally using the same model as Smart Connections, then finds semantically similar notes.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Text to search for (max 500 characters)',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum results to return (1-50, default: 10)',
+          default: 10,
+        },
+        threshold: {
+          type: 'number',
+          description: 'Minimum similarity score (0-1, default: 0.3)',
+          default: 0.3,
+        },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'search_similar',
+    description: 'Find notes semantically similar to an existing note in your vault',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        notePath: {
+          type: 'string',
+          description: 'Path to note relative to vault root (e.g., "Topics/Claude_Code.md")',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum results to return (1-50, default: 10)',
+          default: 10,
+        },
+        threshold: {
+          type: 'number',
+          description: 'Minimum similarity score (0-1, default: 0.3)',
+          default: 0.3,
+        },
+      },
+      required: ['notePath'],
+    },
+  },
+  {
+    name: 'search_by_embedding',
+    description: 'Find notes similar to a provided embedding vector',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        embedding: {
+          type: 'array',
+          items: { type: 'number' },
+          description: 'Embedding vector (must match model dimensions)',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum results to return (1-50, default: 10)',
+          default: 10,
+        },
+        threshold: {
+          type: 'number',
+          description: 'Minimum similarity score (0-1, default: 0.3)',
+          default: 0.3,
+        },
+      },
+      required: ['embedding'],
+    },
+  },
+  {
+    name: 'get_note',
+    description: 'Retrieve the content of a specific note from the vault',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        notePath: {
+          type: 'string',
+          description: 'Path to note relative to vault root',
+        },
+      },
+      required: ['notePath'],
+    },
+  },
+  {
+    name: 'get_model_info',
+    description: 'Get information about the embedding model used by this vault',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: 'list_indexed',
+    description: 'List all notes that have been indexed with embeddings',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        pattern: {
+          type: 'string',
+          description: 'Optional path prefix filter (e.g., "Topics/")',
+        },
+        includeBlocks: {
+          type: 'boolean',
+          description: 'Include block-level entries (default: sources only)',
+          default: false,
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'reindex',
+    description: 'Scan vault for unindexed .md files and compute embeddings for them',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Optional path prefix to limit scope (e.g., "projects/")',
+        },
+      },
+      required: [],
+    },
+  },
+];
+
+// ============================================================================
+// Tool Handlers
+// ============================================================================
+
+export interface ToolContext {
+  config: Config;
+  data: SmartConnectionsData;
+  embedder?: Embedder;
+}
+
+export type ToolResult = {
+  content: Array<{ type: 'text'; text: string }>;
+  isError?: boolean;
+};
+
+/**
+ * Handle search_similar tool call.
+ */
+export function handleSearchSimilar(
+  args: unknown,
+  ctx: ToolContext
+): ToolResult {
+  const parsed = SearchSimilarSchema.safeParse(args);
+  if (!parsed.success) {
+    return errorResult(`Invalid arguments: ${parsed.error.message}`);
+  }
+
+  const { notePath, limit, threshold } = parsed.data;
+
+  // Validate the note path exists in index (no filesystem access needed for search)
+  const normalizedPath = notePath.replace(/^\/+/, '');
+  if (!ctx.data.entries.has(normalizedPath)) {
+    return errorResult(`Note not found in index: ${notePath}`);
+  }
+
+  const raw = findSimilarToNote(normalizedPath, ctx.data.entries, {
+    limit: validateLimit(limit, 1, ctx.config.limits.maxResults, 'limit') * 3,
+    threshold,
+  });
+
+  if (!raw) {
+    return errorResult(`Note not found in index: ${notePath}`);
+  }
+
+  const results = deduplicateByFile(raw).slice(0, validateLimit(limit, 1, ctx.config.limits.maxResults, 'limit'));
+
+  log('INFO', 'search_similar', { notePath, resultCount: results.length });
+
+  return successResult({
+    query: notePath,
+    results,
+  });
+}
+
+/**
+ * Handle search_by_embedding tool call.
+ */
+export function handleSearchByEmbedding(
+  args: unknown,
+  ctx: ToolContext
+): ToolResult {
+  const parsed = SearchByEmbeddingSchema.safeParse(args);
+  if (!parsed.success) {
+    return errorResult(`Invalid arguments: ${parsed.error.message}`);
+  }
+
+  const { embedding, limit, threshold } = parsed.data;
+
+  // Validate embedding dimensions
+  const validation = validateEmbedding(embedding, ctx.data.modelInfo.dimensions);
+  if (!validation.valid) {
+    return errorResult(validation.error!);
+  }
+
+  const raw = findSimilar(embedding, ctx.data.entries, {
+    limit: validateLimit(limit, 1, ctx.config.limits.maxResults, 'limit') * 3,
+    threshold,
+  });
+
+  const results = deduplicateByFile(raw).slice(0, validateLimit(limit, 1, ctx.config.limits.maxResults, 'limit'));
+
+  log('INFO', 'search_by_embedding', { resultCount: results.length });
+
+  return successResult({
+    results,
+  });
+}
+
+/**
+ * Handle search_by_text tool call.
+ *
+ * Computes embedding for the query text locally, then searches.
+ * Requires embedder to be initialized at startup.
+ */
+export async function handleSearchByText(
+  args: unknown,
+  ctx: ToolContext
+): Promise<ToolResult> {
+  // Check if embedder is available
+  if (!ctx.embedder || !ctx.embedder.isReady()) {
+    return errorResult('Text search not available: embedder not initialized');
+  }
+
+  const parsed = SearchByTextSchema.safeParse(args);
+  if (!parsed.success) {
+    return errorResult(`Invalid arguments: ${parsed.error.message}`);
+  }
+
+  const { query, limit, threshold } = parsed.data;
+
+  // Compute embedding for the query text
+  let embedding: number[];
+  try {
+    embedding = await ctx.embedder.embed(query);
+  } catch (e) {
+    log('ERROR', 'search_by_text_embed_failed', { error: String(e) });
+    // Don't expose internal error details to client
+    return errorResult('Failed to compute embedding');
+  }
+
+  // Search using the computed embedding — fetch extra to allow for dedup
+  const raw = findSimilar(embedding, ctx.data.entries, {
+    limit: validateLimit(limit, 1, ctx.config.limits.maxResults, 'limit') * 3,
+    threshold,
+  });
+
+  const results = deduplicateByFile(raw).slice(0, validateLimit(limit, 1, ctx.config.limits.maxResults, 'limit'));
+
+  log('INFO', 'search_by_text', { queryLength: query.length, resultCount: results.length });
+
+  return successResult({
+    query,
+    results,
+  });
+}
+
+/**
+ * Handle get_note tool call.
+ *
+ * SECURITY: This is a sensitive operation - validates path carefully.
+ */
+export function handleGetNote(
+  args: unknown,
+  ctx: ToolContext
+): ToolResult {
+  const parsed = GetNoteSchema.safeParse(args);
+  if (!parsed.success) {
+    return errorResult(`Invalid arguments: ${parsed.error.message}`);
+  }
+
+  const { notePath } = parsed.data;
+
+  // SECURITY: Validate path before any filesystem access
+  const validation = validateNotePath(ctx.config, notePath);
+  if (!validation.valid) {
+    return errorResult(validation.error!);
+  }
+
+  // Read file content
+  let content: string;
+  try {
+    content = fs.readFileSync(validation.resolvedPath!, 'utf-8');
+  } catch {
+    // SECURITY: Don't expose filesystem error details
+    return errorResult('Failed to read note');
+  }
+
+  // SECURITY: Enforce content length limit
+  if (content.length > ctx.config.limits.maxContentLength) {
+    content = content.slice(0, ctx.config.limits.maxContentLength);
+    content += '\n\n[Content truncated - exceeded maximum length]';
+  }
+
+  log('INFO', 'get_note', { notePath, contentLength: content.length });
+
+  return successResult({
+    path: notePath,
+    title: extractTitle(notePath),
+    content,
+  });
+}
+
+/**
+ * Handle get_model_info tool call.
+ */
+export function handleGetModelInfo(
+  _args: unknown,
+  ctx: ToolContext
+): ToolResult {
+  return successResult({
+    modelKey: ctx.data.modelInfo.modelKey,
+    dimensions: ctx.data.modelInfo.dimensions,
+    adapter: ctx.data.modelInfo.adapter,
+  });
+}
+
+/**
+ * Handle list_indexed tool call.
+ */
+export function handleListIndexed(
+  args: unknown,
+  ctx: ToolContext
+): ToolResult {
+  const parsed = ListIndexedSchema.safeParse(args);
+  if (!parsed.success) {
+    return errorResult(`Invalid arguments: ${parsed.error.message}`);
+  }
+
+  const { pattern, includeBlocks } = parsed.data;
+
+  const notes: Array<{ path: string; title: string }> = [];
+
+  for (const [notePath, entry] of ctx.data.entries) {
+    // Default to sources only unless includeBlocks is true
+    if (!includeBlocks && entry.type === 'block') continue;
+
+    // Apply pattern filter if provided
+    if (pattern && !notePath.startsWith(pattern)) {
+      continue;
+    }
+
+    notes.push({
+      path: notePath,
+      title: extractTitle(entry.filePath),
+    });
+  }
+
+  // Sort alphabetically by path
+  notes.sort((a, b) => a.path.localeCompare(b.path));
+
+  return successResult({
+    count: notes.length,
+    notes,
+  });
+}
+
+/**
+ * Handle reindex tool call.
+ *
+ * Scans for unindexed .md files and computes embeddings.
+ */
+export async function handleReindex(
+  args: unknown,
+  ctx: ToolContext
+): Promise<ToolResult> {
+  if (!ctx.embedder || !ctx.embedder.isReady()) {
+    return errorResult('Reindex not available: embedder not initialized');
+  }
+
+  const parsed = ReindexSchema.safeParse(args);
+  if (!parsed.success) {
+    return errorResult(`Invalid arguments: ${parsed.error.message}`);
+  }
+
+  const { path: pathPrefix } = parsed.data;
+
+  const result = await reindex(ctx.config, ctx.data, ctx.embedder, pathPrefix);
+
+  return successResult(result);
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/**
+ * Deduplicate search results by file path, keeping the highest-scoring
+ * block per file. Prevents the same note appearing multiple times.
+ */
+function deduplicateByFile(results: SearchResult[]): SearchResult[] {
+  const seen = new Map<string, SearchResult>();
+  for (const r of results) {
+    const existing = seen.get(r.path);
+    if (!existing || r.score > existing.score) {
+      seen.set(r.path, r);
+    }
+  }
+  return Array.from(seen.values()).sort((a, b) => b.score - a.score);
+}
+
+function successResult(data: unknown): ToolResult {
+  return {
+    content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
+  };
+}
+
+function errorResult(message: string): ToolResult {
+  return {
+    content: [{ type: 'text', text: JSON.stringify({ error: message }) }],
+    isError: true,
+  };
+}
+
+/**
+ * Route a tool call to the appropriate handler.
+ */
+export async function handleToolCall(
+  name: string,
+  args: unknown,
+  ctx: ToolContext
+): Promise<ToolResult> {
+  // Reload embeddings if .smart-env/multi/ has changed on disk
+  ctx.data = refreshIfNeeded(ctx.data);
+
+  switch (name) {
+    case 'search_by_text':
+      return handleSearchByText(args, ctx);
+    case 'search_similar':
+      return handleSearchSimilar(args, ctx);
+    case 'search_by_embedding':
+      return handleSearchByEmbedding(args, ctx);
+    case 'get_note':
+      return handleGetNote(args, ctx);
+    case 'get_model_info':
+      return handleGetModelInfo(args, ctx);
+    case 'list_indexed':
+      return handleListIndexed(args, ctx);
+    case 'reindex':
+      return handleReindex(args, ctx);
+    default:
+      return errorResult(`Unknown tool: ${name}`);
+  }
+}
