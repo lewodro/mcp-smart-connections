@@ -4,8 +4,6 @@
  * SECURITY INVARIANTS (must ALWAYS hold):
  * 1. Path Confinement - Never access files outside configured vault
  * 2. No Traversal - Block ../, symlink escapes, absolute paths
- * 3. File Type Restriction - Only .md files for content retrieval
- * 4. Fail Closed - On any error, deny access
  */
 
 import * as fs from 'node:fs';
