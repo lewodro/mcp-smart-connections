@@ -40,10 +40,6 @@ Exposes [Smart Connections](https://github.com/brianpetro/obsidian-smart-connect
 
 ## Installation
 
-### Prerequisites
-
-- Node.js 18+
-- An Obsidian vault (Smart Connections plugin optional — `reindex` can bootstrap without it)
 
 ### 1. Clone and build
 
